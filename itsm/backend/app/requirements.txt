@@ -2,6 +2,7 @@ fastapi
 uvicorn
 sqlalchemy
 pydantic
+pydantic-settings
 PyMySQL
 redis
 diskcache
@@ -9,3 +10,4 @@ python-multipart
 python-jose[cryptography]
 passlib[bcrypt]
 starlette
+email-validator

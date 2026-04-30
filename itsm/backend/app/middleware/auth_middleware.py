@@ -5,20 +5,19 @@ from jose import JWTError, jwt
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from app.db.session import get_db
+from app.core.config import settings
 from app.controller.user_controller import get_user_data
 from app.controller.customeruser_controller import get_customeruser_data
-from starlette.responses import JSONResponse
 
-# Public routes
+# Public routes that skip auth
 PUBLIC_ROUTES = ["/", "/auth/customer/login", "/auth/token", "/public-resource", "/docs", "/openapi.json"]
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# JWT Secret and Configuration
-SECRET_KEY = "your_secret_key_here"
-ALGORITHM = "HS256"
+SECRET_KEY = settings.SECRET_KEY
+ALGORITHM = settings.ALGORITHM
+
 
 def create_error_response(status_code: int, detail: str):
     return JSONResponse(
@@ -27,8 +26,9 @@ def create_error_response(status_code: int, detail: str):
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Credentials": "true",
-        }
+        },
     )
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -44,38 +44,40 @@ class AuthMiddleware(BaseHTTPMiddleware):
             logger.error("Invalid Authorization header format")
             return create_error_response(401, "Invalid Authorization header format")
 
-        token = authorization.split(" ")[1]
+        token = authorization.split(" ", 1)[1]
 
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            username = payload.get("sub")
-            usertype = payload.get("usertype") or "agent"
+            username: str = payload.get("sub")
+            # FIX: key is "user_type" (with underscore), matching what auth.py encodes
+            user_type: str = payload.get("user_type", "agent")
 
-            if not username or not usertype:
-                logger.error("Token does not contain a valid username or usertype")
+            if not username:
+                logger.error("Token missing 'sub' claim")
                 return create_error_response(401, "Invalid token")
 
             db: Session = next(get_db())
-            if usertype == "agent":
+
+            if user_type == "agent":
                 user = get_user_data(db, username)
-            elif usertype == "customeruser":
+            elif user_type == "customer":
                 user = get_customeruser_data(db, username)
             else:
-                logger.error(f"Unknown usertype: {usertype}")
-                return create_error_response(401, "Invalid usertype in token")
+                logger.error(f"Unknown user_type in token: {user_type}")
+                return create_error_response(401, "Invalid user_type in token")
 
             if not user:
-                logger.error(f"User {username} not found in database")
+                logger.error(f"User '{username}' not found in database")
                 return create_error_response(401, "User not found")
 
             request.state.user = user
+            request.state.user_type = user_type
 
-        except JWTError as jwt_error:
-            logger.error(f"JWT Error: {jwt_error}")
-            return create_error_response(401, "Invalid token or token expired")
+        except JWTError as e:
+            logger.error(f"JWT error: {e}")
+            return create_error_response(401, "Invalid or expired token")
         except Exception as e:
-            logger.error(f"Unhandled error: {e}")
+            logger.error(f"Unhandled auth error: {e}")
             return create_error_response(500, "Internal server error during authentication")
 
-        response = await call_next(request)
-        return response
+        return await call_next(request)

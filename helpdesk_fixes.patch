@@ -1,0 +1,1990 @@
+From 7d71ff36911de106d0e6cf42ce4c9f4ce4186450 Mon Sep 17 00:00:00 2001
+From: Claude Fixes <fix@helpdesk>
+Date: Thu, 30 Apr 2026 02:46:10 +0000
+Subject: [PATCH] fix: auth, user creation, customer user, password hashing,
+ JWT, CORS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backend fixes:
+- auth.py: fix duplicate login_for_access_token function name (agent and
+  customer routes had the same Python function name; Python was silently
+  dropping the agent /token endpoint)
+- auth.py: rename customer route function to customer_login to avoid override
+- auth.py: replace SHA256 password verification with proper bcrypt via passlib
+- auth.py: fix token expiry from 3 min → 60 min (configurable via env)
+- auth.py: move SECRET_KEY / ALGORITHM to settings (config.py)
+- auth.py: fix Optional[str] type hints (was using deprecated 'str or None')
+- middleware: fix JWT key mismatch — token encodes 'user_type' but middleware
+  was reading 'usertype'; customer users were always routed as 'agent'
+- middleware: read SECRET_KEY from settings instead of hardcoding it
+- utils.py: replace SHA256 with bcrypt (passlib CryptContext); add
+  verify_password helper
+- config.py: add SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES,
+  CORS_ORIGINS, DATABASE_URL settings — all configurable via .env
+- db/session.py: read DATABASE_URL from config instead of hardcoding creds
+- main.py: read CORS origins from config instead of hardcoded local IP
+- customeruser_controller.py: fix Delete_customer_cache using wrong
+  'user:' prefix instead of 'customeruser:'
+- customeruser_controller.py: fix get_all_preferences called with login
+  (str) when CustomerPreferences.user_id is FK to customer_user.id (int)
+- customeruser_controller.py: fix customer_user_update email check — was
+  reading from preferences (always empty for CustomerUser); now compares
+  directly against existing_user.email on the model
+- customeruser_controller.py: fix customer_user_update marking optional
+  fields (phone, fax, street, etc.) as required — broke all updates
+- customeruser_controller.py: add email_exists(exclude_user_id) to avoid
+  false duplicate on self-update
+- user_controller.py: fix email_exists to use .exists() query; add
+  exclude_user_id to avoid false duplicate on self-update
+- user_controller.py: implement is_valid_email with real regex (was 'return True')
+- schemas/user.py: make 'mobile' Optional (was required, broke user creation)
+- requirements.txt: add pydantic-settings (was missing, caused ImportError
+  on fresh install) and email-validator (needed by Pydantic EmailStr)
+- add itsm/backend/.env.example for environment configuration
+- update .gitignore to exclude .env files (secrets should not be committed)
+
+Frontend fixes:
+- customerapiClient.js: use REACT_APP_API_URL env var instead of hardcoded IP
+- customerapiClient.js: add 401 interceptor for auto-logout
+- agentapiClient.js: use REACT_APP_API_URL env var instead of hardcoded IP
+- agentapiClient.js: add 401 interceptor for auto-logout
+- AuthService.js: fix customer login using agentapiClient (wrong!) — now uses
+  customerapiClient so the correct customeruser_token cookie is attached
+- AuthService.js: add agentLogoutApi / customerLogoutApi helpers
+- AuthService.js: improve error message to surface backend 'detail' field
+- PrivateRoute.js: check cookie as fallback when Redux state is false —
+  previously page refresh evicted Redux state and force-redirected logged-in
+  users back to the login page even with a valid cookie
+- add itsm/frontend/.env.example
+---
+ .gitignore                                    |   6 +-
+ itsm/backend/.env.example                     |  17 +
+ itsm/backend/app/api/v1/auth.py               | 347 ++++----
+ .../app/controller/customeruser_controller.py | 828 +++++++-----------
+ .../backend/app/controller/user_controller.py |  34 +-
+ itsm/backend/app/core/config.py               |  18 +-
+ itsm/backend/app/db/session.py                |   5 +-
+ itsm/backend/app/main.py                      |  36 +-
+ .../backend/app/middleware/auth_middleware.py | 164 ++--
+ itsm/backend/app/requirements.txt             |   2 +
+ itsm/backend/app/schemas/user.py              |   7 +-
+ itsm/backend/app/utils.py                     |  11 +-
+ itsm/frontend/.env.example                    |   2 +
+ itsm/frontend/src/api/agentapiClient.js       |  44 +-
+ itsm/frontend/src/api/customerapiClient.js    |  45 +-
+ itsm/frontend/src/auth/PrivateRoute.js        |  55 +-
+ itsm/frontend/src/services/AuthService.js     | 108 +--
+ 17 files changed, 772 insertions(+), 957 deletions(-)
+ create mode 100644 itsm/backend/.env.example
+ create mode 100644 itsm/frontend/.env.example
+
+diff --git a/.gitignore b/.gitignore
+index 62d9a5f9..918a6913 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,4 +6,8 @@
+ __pycache__/
+ /cache
+ itsm/cache/
+-.env
+\ No newline at end of file
++.env
++# Environment secrets - never commit real .env files
++itsm/backend/.env
++itsm/frontend/.env
++itsm/frontend/.env.local
+diff --git a/itsm/backend/.env.example b/itsm/backend/.env.example
+new file mode 100644
+index 00000000..1cb6478b
+--- /dev/null
++++ b/itsm/backend/.env.example
+@@ -0,0 +1,17 @@
++# Copy this file to .env and fill in your values
++
++# JWT
++SECRET_KEY=replace-with-a-long-random-secret
++ALGORITHM=HS256
++ACCESS_TOKEN_EXPIRE_MINUTES=60
++
++# Database
++DATABASE_URL=mysql+pymysql://user:password@localhost/helpdesk
++
++# CORS - comma-separated list of allowed frontend origins
++CORS_ORIGINS=http://localhost:3000,http://192.168.1.8:3000
++
++# Cache
++CACHE_TYPE=diskcache
++DISKCACHE_DIR=/opt/helpdesk_app/itsm/cache
++REDIS_URL=redis://localhost:6379/0
+diff --git a/itsm/backend/app/api/v1/auth.py b/itsm/backend/app/api/v1/auth.py
+index 96b19836..f96f2397 100644
+--- a/itsm/backend/app/api/v1/auth.py
++++ b/itsm/backend/app/api/v1/auth.py
+@@ -1,189 +1,158 @@
+-import logging
+-from fastapi import APIRouter, Depends, HTTPException, status
+-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+-from pydantic import BaseModel
+-from sqlalchemy.orm import Session
+-from passlib.context import CryptContext
+-from jose import JWTError, jwt
+-from datetime import datetime, timedelta
+-from app.utils import hash_password
+-from app.db.session import get_db
+-from app.controller.user_controller import get_user_data, get_user_hash_pwd
+-from app.controller.customeruser_controller import get_customeruser_data, get_customeruser_hash_pwd
+-# Setup logging
+-logging.basicConfig(level=logging.INFO)
+-logger = logging.getLogger(__name__)
+-
+-# JWT Secret and Configuration
+-SECRET_KEY = "your_secret_key_here"
+-ALGORITHM = "HS256"
+-ACCESS_TOKEN_EXPIRE_MINUTES = 3
+-
+-# OAuth2 scheme
+-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+-
+-# Password hashing context
+-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+-
+-# Router for authentication-related routes
+-router = APIRouter()
+-
+-# Models
+-class Token(BaseModel):
+-    access_token: str
+-    token_type: str
+-    user_type :str
+-
+-class TokenData(BaseModel):
+-    username: str or None = None
+-
+-class User(BaseModel):
+-    username: str
+-    email: str or None = None
+-    valid_id: int or None = None
+-
+-class UserInDB(User):
+-    hashed_password: str
+-
+-# Utility functions for hashing and token management
+-def verify_password(plain_password, hashed_password):
+-    try:
+-        return plain_password == hashed_password
+-    except Exception as e:
+-        logger.error(f"Password verification failed: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Password verification failed")
+-
+-def get_password_hash(password):
+-    try:
+-        return hash_password(password)
+-    except Exception as e:
+-        logger.error(f"Error hashing password: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error hashing password")
+-
+-def create_access_token(data: dict, expires_delta: timedelta or None = None):
+-    try:
+-        to_encode = data.copy()
+-        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+-        to_encode.update({"exp": expire})
+-        return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+-    except Exception as e:
+-        logger.error(f"Error creating access token: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Token creation failed")
+-
+-# Dependency: Get user from DB by login
+-def get_user(db: Session, login: str):
+-    try:
+-        return get_user_data(db, login)
+-    except Exception as e:
+-        logger.error(f"Error fetching user data: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error fetching user data")
+-
+-# Authenticate user
+-def authenticate_user(db: Session, login: str, password: str):
+-    try:
+-        user = get_user(db, login)
+-        hashed_password = get_user_hash_pwd(db, login)
+-        password = hash_password(password)
+-        if not user or not verify_password(password, hashed_password):
+-            return None
+-        return user
+-    except Exception as e:
+-        logger.error(f"Authentication failed: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Authentication failed")
+-
+-# Dependency: Get current user based on the token
+-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+-    credentials_exception = HTTPException(
+-        status_code=status.HTTP_401_UNAUTHORIZED,
+-        detail="Could not validate credentials",
+-        headers={"WWW-Authenticate": "Bearer"},
+-    )
+-    try:
+-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+-        username: str = payload.get("sub")
+-        if username is None:
+-            raise credentials_exception
+-        token_data = TokenData(username=username)
+-    except JWTError as e:
+-        logger.error(f"JWT validation error: {str(e)}")
+-        raise credentials_exception
+-    except Exception as e:
+-        logger.error(f"Token decoding failed: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Token decoding failed")
+-    
+-    user = get_user(db, login=token_data.username)
+-    if user is None:
+-        raise credentials_exception
+-    return user
+-
+-# Dependency: Get current active user
+-async def get_current_active_user(current_user: UserInDB = Depends(get_current_user)):
+-    try:
+-        if current_user["valid_id"] != 1:
+-            raise HTTPException(status_code=400, detail="Inactive user")
+-        return current_user
+-    except AttributeError as e:
+-        logger.error(f"User object has no attribute 'valid_id': {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid user object")
+-
+-# Route: Token generation for login
+-@router.post("/token", response_model=Token)
+-async def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
+-    user = authenticate_user(db, form_data.username, form_data.password)
+-    print(user)
+-    if not user:
+-        print(user)
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Incorrect username or password",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        )
+-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+-    access_token = create_access_token(data={"sub": user['login'],"user_type":"agent"}, expires_delta=access_token_expires)
+-    return {"access_token": access_token, "token_type": "bearer","user_type":"agent"}
+-    
+-
+-# Protected route: User details (example route)
+-@router.get("/me/")
+-async def read_users_me(current_user: UserInDB = Depends(get_current_active_user)):
+-    try:
+-        return current_user
+-    except Exception as e:
+-        logger.error(f"Failed to fetch current user: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch user details")
+-
+-# Dependency: Get user from DB by login
+-def get_customeruser(db: Session, login: str):
+-    try:
+-        return get_customeruser_data(db, login)
+-    except Exception as e:
+-        logger.error(f"Error fetching user data: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error fetching user data")
+-    
+-def authenticate_customeruser(db: Session, login: str, password: str):
+-    try:
+-        user = get_customeruser(db, login)
+-        hashed_password = get_customeruser_hash_pwd(db, login)
+-        password = hash_password(password)
+-        if not user or not verify_password(password, hashed_password):
+-            return None
+-        return user
+-    except Exception as e:
+-        logger.error(f"Authentication failed: {str(e)}")
+-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Authentication failed")
+-
+-# Route: Token generation for login
+-@router.post("/customer/login", response_model=Token)
+-async def login_for_access_token(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
+-    user = authenticate_customeruser(db, form_data.username, form_data.password)
+-    print(user)
+-    if not user:
+-        print(user)
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Incorrect username or password",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        )
+-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+-    access_token = create_access_token(data={"sub": user['login'],"user_type":"customer"}, expires_delta=access_token_expires)
+-    return {"access_token": access_token, "token_type": "bearer", "user_type":"customer"}
+\ No newline at end of file
++import logging
++from typing import Optional
++from fastapi import APIRouter, Depends, HTTPException, status
++from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
++from pydantic import BaseModel
++from sqlalchemy.orm import Session
++from jose import JWTError, jwt
++from datetime import datetime, timedelta
++from app.utils import hash_password, verify_password
++from app.db.session import get_db
++from app.core.config import settings
++from app.controller.user_controller import get_user_data, get_user_hash_pwd
++from app.controller.customeruser_controller import get_customeruser_data, get_customeruser_hash_pwd
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger(__name__)
++
++SECRET_KEY = settings.SECRET_KEY
++ALGORITHM = settings.ALGORITHM
++ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
++
++oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
++
++router = APIRouter()
++
++# ── Pydantic models ──────────────────────────────────────────────────────────
++
++class Token(BaseModel):
++    access_token: str
++    token_type: str
++    user_type: str
++
++class TokenData(BaseModel):
++    username: Optional[str] = None
++
++class User(BaseModel):
++    username: str
++    email: Optional[str] = None
++    valid_id: Optional[int] = None
++
++class UserInDB(User):
++    hashed_password: str
++
++# ── Token helpers ────────────────────────────────────────────────────────────
++
++def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
++    try:
++        to_encode = data.copy()
++        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
++        to_encode.update({"exp": expire})
++        return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
++    except Exception as e:
++        logger.error(f"Error creating access token: {e}")
++        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Token creation failed")
++
++# ── Agent auth ───────────────────────────────────────────────────────────────
++
++def _get_agent(db: Session, login: str):
++    try:
++        return get_user_data(db, login)
++    except Exception as e:
++        logger.error(f"Error fetching agent: {e}")
++        raise HTTPException(status_code=500, detail="Error fetching user data")
++
++def authenticate_agent(db: Session, login: str, password: str):
++    user = _get_agent(db, login)
++    if not user:
++        return None
++    hashed = get_user_hash_pwd(db, login)
++    if not hashed or not verify_password(password, hashed):
++        return None
++    return user
++
++async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
++    credentials_exception = HTTPException(
++        status_code=status.HTTP_401_UNAUTHORIZED,
++        detail="Could not validate credentials",
++        headers={"WWW-Authenticate": "Bearer"},
++    )
++    try:
++        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
++        username: str = payload.get("sub")
++        if username is None:
++            raise credentials_exception
++        token_data = TokenData(username=username)
++    except JWTError as e:
++        logger.error(f"JWT error: {e}")
++        raise credentials_exception
++
++    user = _get_agent(db, login=token_data.username)
++    if user is None:
++        raise credentials_exception
++    return user
++
++async def get_current_active_user(current_user: UserInDB = Depends(get_current_user)):
++    if current_user.get("valid_id") != 1:
++        raise HTTPException(status_code=400, detail="Inactive user")
++    return current_user
++
++# ── Customer auth ────────────────────────────────────────────────────────────
++
++def _get_customer(db: Session, login: str):
++    try:
++        return get_customeruser_data(db, login)
++    except Exception as e:
++        logger.error(f"Error fetching customer user: {e}")
++        raise HTTPException(status_code=500, detail="Error fetching customer user data")
++
++def authenticate_customer(db: Session, login: str, password: str):
++    user = _get_customer(db, login)
++    if not user:
++        return None
++    hashed = get_customeruser_hash_pwd(db, login)
++    if not hashed or not verify_password(password, hashed):
++        return None
++    return user
++
++# ── Routes ───────────────────────────────────────────────────────────────────
++
++@router.post("/token", response_model=Token)
++async def agent_login(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
++    """Agent (staff) login — returns a JWT with user_type='agent'."""
++    user = authenticate_agent(db, form_data.username, form_data.password)
++    if not user:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Incorrect username or password",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
++    token = create_access_token(
++        data={"sub": user["login"], "user_type": "agent"},
++        expires_delta=expires,
++    )
++    return {"access_token": token, "token_type": "bearer", "user_type": "agent"}
++
++
++@router.post("/customer/login", response_model=Token)
++async def customer_login(db: Session = Depends(get_db), form_data: OAuth2PasswordRequestForm = Depends()):
++    """Customer user login — returns a JWT with user_type='customer'."""
++    user = authenticate_customer(db, form_data.username, form_data.password)
++    if not user:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Incorrect username or password",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++    expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
++    token = create_access_token(
++        data={"sub": user["login"], "user_type": "customer"},
++        expires_delta=expires,
++    )
++    return {"access_token": token, "token_type": "bearer", "user_type": "customer"}
++
++
++@router.get("/me/")
++async def read_users_me(current_user: UserInDB = Depends(get_current_active_user)):
++    return current_user
+diff --git a/itsm/backend/app/controller/customeruser_controller.py b/itsm/backend/app/controller/customeruser_controller.py
+index d812946f..14e823e7 100644
+--- a/itsm/backend/app/controller/customeruser_controller.py
++++ b/itsm/backend/app/controller/customeruser_controller.py
+@@ -1,521 +1,307 @@
+-from sqlalchemy.orm import Session
+-from app.models.customeruser import CustomerUser
+-from app.models.customer_preferences import CustomerPreferences
+-from app.schemas.customeruserSchema import CustomerUserSchema
+-from app.utils import hash_password, generate_random_password
+-from app.core.logging import get_logger
+-from sqlalchemy import func
+-from app.core.cache import Cache
+-from sqlalchemy import select, or_
+-from math import ceil
+-from typing import List, Optional
+-logger = get_logger(__name__)
+-cache = Cache()
+-
+-class EmailAlreadyExistsError(Exception):
+-    pass
+-
+-class LoginAlreadyExistsError(Exception):
+-    pass
+-
+-class CommanErrorException(Exception):
+-    pass
+-
+-def customeruser_add(db: Session, user: CustomerUserSchema, change_user_id: int):
+-    # Check required fields
+-    required_fields = ["first_name", "last_name", "login", "email", "valid_id"]
+-    for field in required_fields:
+-        if not getattr(user, field, None):
+-            logger.error(f"Need {field}!")
+-            return None
+-
+-    # Check if email address is valid
+-    if not is_valid_email(user.email):
+-        logger.error(f"Email address ({user.email}) not valid!")
+-        return None
+-
+-    # Check if email is already used
+-    if email_exists(db, user.email):
+-        logger.error(f"Email address ({user.email}) is already used by another user.")
+-        raise EmailAlreadyExistsError(f"Email address ({user.email}) is already used.")
+-
+-    # Check if user with this login already exists
+-    existing_user = UserLoginExistsCheck(db, user.login)
+-    if existing_user:
+-        logger.error(f"A user with the username '{user.login}' already exists.")
+-        raise LoginAlreadyExistsError(f"A user with the username '{user.login}' already exists.")
+-
+-    # Generate password if not provided
+-    if not user.password:
+-        user.password = generate_random_password()
+-
+-    # Create new user with the additional fields
+-    new_user = CustomerUser(
+-        title=user.title,
+-        email=user.email,
+-        first_name=user.first_name,
+-        last_name=user.last_name,
+-        login=user.login,
+-        pw=hash_password(user.password),
+-        valid_id=user.valid_id,
+-        customer_id=user.customer_id,  # Added customer_id
+-        phone=user.phone,  # Added phone
+-        fax=user.fax,  # Added fax
+-        mobile=user.mobile,  # Added mobile
+-        street=user.street,  # Added street
+-        zip=user.zip,  # Added zip
+-        city=user.city,  # Added city
+-        country=user.country,  # Added country
+-        comments=user.comments,  # Added comments
+-        create_by=change_user_id,
+-        change_by=change_user_id,
+-        create_time=func.now(),
+-        change_time=func.now()
+-    )
+-    db.add(new_user)
+-    db.commit()
+-    db.refresh(new_user)
+-
+-    user_id = new_user.id
+-    # Set user preferences
+-
+-    user_data = {
+-        'id': new_user.id,
+-        'title': new_user.title,
+-        'first_name': new_user.first_name,
+-        'last_name': new_user.last_name,
+-        'login': new_user.login,
+-        'valid_id': new_user.valid_id,
+-        'create_by': new_user.create_by,
+-        'change_by': new_user.change_by,
+-        'create_time': new_user.create_time.isoformat(),
+-        'change_time': new_user.change_time.isoformat(),
+-        'email': new_user.email,
+-        'mobile': new_user.mobile,
+-        'customer_id': new_user.customer_id,  # Added customer_id to user_data
+-        'phone': new_user.phone,  # Added phone to user_data
+-        'fax': new_user.fax,  # Added fax to user_data
+-        'street': new_user.street,  # Added street to user_data
+-        'zip': new_user.zip,  # Added zip to user_data
+-        'city': new_user.city,  # Added city to user_data
+-        'country': new_user.country,  # Added country to user_data
+-        'comments': new_user.comments  # Added comments to user_data
+-    }
+-
+-    # Cache user data
+-    cache.set(f"customeruser:{user.login}", user_data, expire=3600)  # Store user object in cache
+-    return user_data
+-
+-
+-def is_valid_email(email: str) -> bool:
+-    # Implement email validation logic
+-    return True  # Assuming email validation is correct
+-
+-def email_exists(db: Session, email: str) -> bool:
+-    # Check if the email exists in the UserPreference table
+-    email_exists = db.query(CustomerUser.email).filter(
+-        CustomerUser.email == email.encode('utf-8')
+-    ).first()
+-    
+-    # If a matching email is found, return True
+-    if email_exists:
+-        return True
+-    
+-    # If no matching email is found, return False
+-    return False
+-
+-def get_customeruser_data(db: Session, identifier):
+-    cache_key = f"customeruser:{identifier}"
+-    cached_user = cache.get(cache_key)
+-    print(f"cached_user {cached_user}")
+-
+-    if cached_user:
+-        return cached_user
+-
+-    # Fetch user data from the database
+-    user_data = None
+-    if isinstance(identifier, int):
+-        user_data = db.query(CustomerUser).filter(CustomerUser.id == identifier).first()
+-    elif isinstance(identifier, str):
+-        user_data = db.query(CustomerUser).filter(CustomerUser.login == identifier).first()
+-    
+-    if user_data:
+-        # Fetch user preferences
+-        preferences = get_all_preferences(db, user_data.login)
+-
+-        # Prepare response data with additional fields
+-        response_data = {
+-            'id': user_data.id,
+-            'login': user_data.login,
+-            'title': user_data.title,
+-            'first_name': user_data.first_name,
+-            'last_name': user_data.last_name,
+-            'email': user_data.email,
+-            'valid_id': user_data.valid_id,
+-            'customer_id': user_data.customer_id,  # Added customer_id
+-            'phone': user_data.phone,              # Added phone
+-            'fax': user_data.fax,                  # Added fax
+-            'mobile': user_data.mobile,            # Added mobile
+-            'street': user_data.street,            # Added street
+-            'zip': user_data.zip,                  # Added zip
+-            'city': user_data.city,                # Added city
+-            'country': user_data.country,          # Added country
+-            'comments': user_data.comments,        # Added comments
+-            'create_by': user_data.create_by,
+-            'change_by': user_data.change_by,
+-            'create_time': user_data.create_time.isoformat(),
+-            'change_time': user_data.change_time.isoformat(),
+-            'preferences': preferences,
+-        }
+-        print(f"response_data {response_data}")
+-        
+-        # Store in cache if found
+-        cache.set(cache_key, response_data, expire=3600)  # Cache for 1 hour
+-
+-        return response_data
+-
+-    return None
+-
+-
+-def set_preferences(db: Session, user_id: int, key: str, value: str):
+-    # Delete old data
+-    db.query(CustomerPreferences).filter(CustomerPreferences.user_id == user_id, CustomerPreferences.preferences_key == key).delete()
+-
+-    # Insert new data
+-    new_preference = CustomerPreferences(
+-        user_id=user_id,
+-        preferences_key=key,
+-        preferences_value=value.encode('utf-8') if value else None  # Convert string to bytes
+-    )
+-    db.add(new_preference)
+-    db.commit()
+-
+-def get_preferences(db: Session, user_id: str = None, key: str = None) -> List[str]:
+-    # Create a select query to retrieve preferences based on user_id and/or key
+-    if user_id and key:
+-        stmt = select(CustomerPreferences.preferences_value).where(
+-            CustomerPreferences.user_id == user_id,
+-            CustomerPreferences.preferences_key == key
+-        )
+-    elif user_id:
+-        stmt = select(CustomerPreferences.preferences_value).where(
+-            CustomerPreferences.user_id == user_id
+-        )
+-    elif key:
+-        stmt = select(CustomerPreferences.preferences_value).where(
+-            CustomerPreferences.preferences_key == key
+-        )        
+-    else:
+-        return []  # Return an empty list if neither user_id nor key is provided
+-
+-    
+-    # Execute the query and fetch all results
+-    result = db.execute(stmt).scalars().all()  # Fetch all matching records
+-
+-    # Decode each result (as they're stored as bytes) and return as a list of strings
+-    return [r.decode('utf-8') for r in result] if result else []
+-
+-
+-def get_all_preferences(db: Session, user_id: str) -> dict:
+-    cache_key = f"customerpreferences:{user_id}"
+-    cached_preferences = cache.get(cache_key)
+-    logger.info(f"Fetching preferences for user {user_id} from cache: {cached_preferences}")
+-
+-    if cached_preferences:
+-        return cached_preferences
+-
+-    try:
+-        # Create a select query to retrieve all preferences based on user_id
+-        stmt = select(CustomerPreferences.preferences_key, CustomerPreferences.preferences_value).where(
+-            CustomerPreferences.user_id == user_id
+-        )
+-
+-        # Execute the query and fetch all results
+-        result = db.execute(stmt).all()
+-
+-        if not result:
+-            logger.info(f"No preferences found for user {user_id}.")
+-            return {}
+-
+-        # Convert the result into a dictionary
+-        preferences = {
+-            row[0]: row[1] if isinstance(row[1], str) else row[1].decode('utf-8') if row[1] else None
+-            for row in result
+-        }
+-        
+-        # Cache the preferences
+-        cache.set(cache_key, preferences, expire=3600)
+-        logger.info(f"Caching preferences for user {user_id}: {preferences}")
+-        
+-        return preferences
+-
+-    except Exception as e:
+-        logger.error(f"Error fetching preferences for user {user_id}: {str(e)}")
+-        return {}
+-
+-
+-
+-def get_customeruser_hash_pwd(db: Session, login: str) -> str:
+-    existing_user_password = db.query(CustomerUser.pw).filter(CustomerUser.login == login).first()
+-    
+-    if existing_user_password:
+-        return existing_user_password[0]  # Return the first element of the tuple
+-    return None
+-
+-def UserLoginExistsCheck(db: Session, user_login: str, user_id: int = None) -> bool:
+-    query = select(CustomerUser.id).where(CustomerUser.login == user_login)
+-    result = db.execute(query).fetchall()
+-
+-    # If a user login is found
+-    for row in result:
+-        existing_user_id = row[0]
+-        if not user_id or user_id != existing_user_id:
+-            return True  # User login exists, and user_id doesn't match
+-
+-    return False  # User login does not exist or matches the current user
+-
+-from math import ceil
+-
+-def get_customeruser_list(db: Session, page_no: int = 1, count_per_page: int = 10):
+-    try:
+-        # Validate input
+-        if page_no < 1 or count_per_page < 1:
+-            logger.error("Page number and count per page must be greater than zero.")
+-            raise CommanErrorException("Page number and count per page must be greater than zero.")
+-
+-        # Calculate the offset (how many records to skip)
+-        offset_value = (page_no - 1) * count_per_page
+-
+-        # Get the total number of users
+-        total_users = db.query(CustomerUser).count()
+-
+-        # Calculate the total number of pages
+-        total_pages = ceil(total_users / count_per_page)
+-
+-        # Select the users for the given page
+-        stmt = select(CustomerUser).offset(offset_value).limit(count_per_page)
+-        result = db.execute(stmt).scalars().all()
+-
+-        # Prepare the user data in a list
+-        user_list = []
+-        for user in result:
+-            user_data = {
+-                'id': user.id,
+-                'login': user.login,
+-                'title': user.title,
+-                'first_name': user.first_name,
+-                'last_name': user.last_name,
+-                'email': user.email,                  # Added email
+-                'valid_id': user.valid_id,
+-                'customer_id': user.customer_id,      # Added customer_id
+-                'phone': user.phone,                  # Added phone
+-                'fax': user.fax,                      # Added fax
+-                'mobile': user.mobile,                # Added mobile
+-                'street': user.street,                # Added street
+-                'zip': user.zip,                      # Added zip
+-                'city': user.city,                    # Added city
+-                'country': user.country,              # Added country
+-                'comments': user.comments,            # Added comments
+-                'create_by': user.create_by,
+-                'change_by': user.change_by,
+-                'create_time': user.create_time.isoformat(),
+-                'change_time': user.change_time.isoformat(),
+-            }
+-            user_list.append(user_data)
+-
+-        # Pagination response
+-        return {
+-            'total_users': total_users,
+-            'total_pages': total_pages,
+-            'current_page': page_no,
+-            'users': user_list
+-        }
+-    except Exception as e:
+-        logger.exception("Failed to retrieve user list.")
+-        raise CommanErrorException("Failed to retrieve user list.")
+-
+-
+-def get_customeruser_search(db: Session, 
+-                    Search: Optional[str] = None, 
+-                    UserLogin: Optional[str] = None) -> List[dict]:
+-    """
+-    Searches for users based on Search (for name or login), UserLogin (exact login), 
+-    or PostMasterSearch (preference key search). At least one search parameter is required.
+-
+-    :param db: SQLAlchemy session to interact with the database.
+-    :param Search: A string to search in first name, last name, or login.
+-    :param UserLogin: A string to perform an exact login match.
+-    :param PostMasterSearch: A preference key to search related to users.
+-    :return: A list of user dictionaries or preferences.
+-    :raises HTTPException: If no search parameters are provided or an error occurs.
+-    """
+-    try:
+-        # Ensure at least one search parameter is provided
+-        if not Search and not UserLogin:
+-            logger.error("No search parameters provided")
+-            raise CommanErrorException("At least one search parameter must be provided.")
+-
+-        # Initialize the query
+-        query = db.query(CustomerUser)
+-
+-        # Apply filters based on provided parameters
+-        if Search:
+-            search_term = f"%{Search}%"  # Wildcard search
+-            query = query.filter(
+-                or_(
+-                    CustomerUser.first_name.ilike(search_term),  # Case-insensitive search
+-                    CustomerUser.last_name.ilike(search_term),
+-                    CustomerUser.login.ilike(search_term)
+-                )
+-            )
+-            logger.info(f"Searching users by name or login using: {Search}")
+-
+-        if UserLogin:
+-            user_login_term = f"%{UserLogin}%"
+-            query = query.filter(CustomerUser.login.ilike(user_login_term))  # Case-insensitive for login
+-            logger.info(f"Searching users by exact login using: {UserLogin}")
+-
+-        # Execute the query and fetch results
+-        users = query.all()
+-
+-        # If no users are found, return an empty list
+-        if not users:
+-            logger.info("No users found for the given search parameters")
+-            return []
+-
+-        # Prepare the user data in a list with the new fields
+-        user_list = []
+-        for user in users:
+-            user_data = {
+-                'id': user.id,
+-                'login': user.login,
+-                'title': user.title,
+-                'first_name': user.first_name,
+-                'last_name': user.last_name,
+-                'email': user.email,                  # Added email
+-                'valid_id': user.valid_id,
+-                'customer_id': user.customer_id,      # Added customer_id
+-                'phone': user.phone,                  # Added phone
+-                'fax': user.fax,                      # Added fax
+-                'mobile': user.mobile,                # Added mobile
+-                'street': user.street,                # Added street
+-                'zip': user.zip,                      # Added zip
+-                'city': user.city,                    # Added city
+-                'country': user.country,              # Added country
+-                'comments': user.comments,            # Added comments
+-                'create_by': user.create_by,
+-                'change_by': user.change_by,
+-                'create_time': user.create_time.isoformat(),
+-                'change_time': user.change_time.isoformat(),
+-            }
+-            user_list.append(user_data)
+-
+-        return user_list
+-
+-    except CommanErrorException as e:
+-        logger.error(f"HTTP error: {e.detail}")
+-        raise e  # Re-raise HTTPException for FastAPI to handle it correctly
+-
+-    except Exception as e:
+-        logger.exception("Failed to perform user search.")
+-        raise CommanErrorException("An unexpected error occurred.")
+-
+-
+-def customer_user_update(db: Session, user_id: int, user: CustomerUserSchema, change_user_id: int):
+-    # Fetch existing user from the database
+-    existing_user = db.query(CustomerUser).filter(CustomerUser.id == user_id).first()
+-    
+-    if not existing_user:
+-        logger.error(f"User with ID '{user_id}' not found.")
+-        raise CommanErrorException(f"User with ID '{user_id}' not found.")
+-    
+-    # Check required fields
+-    required_fields = ["first_name", "last_name", "login", "email", "valid_id", "customer_id", "phone", "fax", "mobile", "street", "zip", "city", "country", "comments"]
+-    for field in required_fields:
+-        if not getattr(user, field, None):
+-            logger.error(f"Need {field}!")
+-            raise CommanErrorException(f"Need {field}!")
+-
+-    # Check if email address is valid
+-    if not is_valid_email(user.email):
+-        logger.error(f"Email address ({user.email}) not valid!")
+-        raise CommanErrorException(f"Email address ({user.email}) not valid!")
+-
+-    exist_preferences = get_all_preferences(db, user_id)
+-    
+-    # Check if email is already used (only if the email has changed)
+-    if user.email != exist_preferences.get('UserEmail'):
+-        if email_exists(db, user.email):
+-            logger.error(f"Email address ({user.email}) is already used by another user.")
+-            raise EmailAlreadyExistsError(f"Email address ({user.email}) is already used.")
+-    
+-    # Check if user with this login already exists (only if the login has changed)
+-    if user.login != existing_user.login and UserLoginExistsCheck(db, user.login):
+-        logger.error(f"A user with the username '{user.login}' already exists.")
+-        raise LoginAlreadyExistsError(f"A user with the username '{user.login}' already exists.")
+-    
+-    # Update the user data
+-    existing_user.first_name = user.first_name
+-    existing_user.last_name = user.last_name
+-    existing_user.login = user.login
+-    existing_user.email = user.email
+-    existing_user.valid_id = user.valid_id
+-    existing_user.customer_id = user.customer_id  # Update customer_id
+-    existing_user.phone = user.phone  # Update phone
+-    existing_user.fax = user.fax  # Update fax
+-    existing_user.mobile = user.mobile  # Update mobile
+-    existing_user.street = user.street  # Update street
+-    existing_user.zip = user.zip  # Update zip
+-    existing_user.city = user.city  # Update city
+-    existing_user.country = user.country  # Update country
+-    existing_user.comments = user.comments  # Update comments
+-    existing_user.change_by = change_user_id
+-    existing_user.change_time = func.now()
+-
+-    # Update password if provided
+-    if user.password:
+-        existing_user.pw = hash_password(user.password)
+-
+-    db.commit()
+-    db.refresh(existing_user)
+-
+-    # Update preferences (if applicable)
+-
+-    # Prepare updated user data
+-    user_data = {
+-        'id': existing_user.id,
+-        'title': existing_user.title,
+-        'first_name': existing_user.first_name,
+-        'last_name': existing_user.last_name,
+-        'login': existing_user.login,
+-        'valid_id': existing_user.valid_id,
+-        'create_by': existing_user.create_by,
+-        'change_by': existing_user.change_by,
+-        'create_time': existing_user.create_time.isoformat(),
+-        'change_time': existing_user.change_time.isoformat(),
+-        'email': existing_user.email,
+-        'mobile': existing_user.mobile,
+-        'customer_id': existing_user.customer_id,  # Added customer_id to user_data
+-        'phone': existing_user.phone,  # Added phone to user_data
+-        'fax': existing_user.fax,  # Added fax to user_data
+-        'street': existing_user.street,  # Added street to user_data
+-        'zip': existing_user.zip,  # Added zip to user_data
+-        'city': existing_user.city,  # Added city to user_data
+-        'country': existing_user.country,  # Added country to user_data
+-        'comments': existing_user.comments  # Added comments to user_data
+-    }
+-    
+-    Delete_user_cache(existing_user.login, existing_user.id)
+-    
+-    # Update the cache with the updated user data
+-    cache.set(f"customeruser:{existing_user.login}", user_data, expire=3600)  # Store updated user object in cache
+-    cache.set(f"customeruser:{existing_user.id}", user_data, expire=3600)  # Store updated user object in cache
+-
+-    return user_data
+-
+-
+-def Delete_user_cache(login:str = None, user_id:int = None):
+-    cache.delete(f"user:{login}")
+-    cache.delete(f"user:{user_id}")
+-    cache.delete(f"preferences:{user_id}")
+-    cache.delete(f"preferences:{login}")
++from sqlalchemy.orm import Session
++from app.models.customeruser import CustomerUser
++from app.models.customer_preferences import CustomerPreferences
++from app.schemas.customeruserSchema import CustomerUserSchema
++from app.utils import hash_password, generate_random_password
++from app.core.logging import get_logger
++from sqlalchemy import func
++from app.core.cache import Cache
++from sqlalchemy import select, or_
++from math import ceil
++from typing import List, Optional
++
++logger = get_logger(__name__)
++cache = Cache()
++
++
++class EmailAlreadyExistsError(Exception):
++    pass
++
++class LoginAlreadyExistsError(Exception):
++    pass
++
++class CommanErrorException(Exception):
++    pass
++
++
++# ── Helpers ───────────────────────────────────────────────────────────────────
++
++def is_valid_email(email: str) -> bool:
++    import re
++    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
++    return bool(re.match(pattern, email))
++
++
++def email_exists(db: Session, email: str, exclude_user_id: int = None) -> bool:
++    """Check if email is already taken by a different customer user."""
++    query = db.query(CustomerUser.id).filter(CustomerUser.email == email)
++    if exclude_user_id:
++        query = query.filter(CustomerUser.id != exclude_user_id)
++    return db.query(query.exists()).scalar()
++
++
++def UserLoginExistsCheck(db: Session, user_login: str, user_id: int = None) -> bool:
++    query = select(CustomerUser.id).where(CustomerUser.login == user_login)
++    result = db.execute(query).fetchall()
++    for row in result:
++        existing_id = row[0]
++        if not user_id or user_id != existing_id:
++            return True
++    return False
++
++
++def set_preferences(db: Session, user_id: int, key: str, value: str):
++    db.query(CustomerPreferences).filter(
++        CustomerPreferences.user_id == user_id,
++        CustomerPreferences.preferences_key == key,
++    ).delete()
++    new_pref = CustomerPreferences(
++        user_id=user_id,
++        preferences_key=key,
++        preferences_value=value if value else None,
++    )
++    db.add(new_pref)
++    db.commit()
++
++
++def get_all_preferences(db: Session, user_id: int) -> dict:
++    """FIX: user_id must be int (CustomerPreferences.user_id is a FK to customer_user.id)."""
++    cache_key = f"customerpreferences:{user_id}"
++    cached = cache.get(cache_key)
++    if cached:
++        return cached
++    try:
++        stmt = select(
++            CustomerPreferences.preferences_key,
++            CustomerPreferences.preferences_value,
++        ).where(CustomerPreferences.user_id == user_id)
++        result = db.execute(stmt).all()
++        if not result:
++            return {}
++        prefs = {row[0]: row[1] for row in result}
++        cache.set(cache_key, prefs, expire=3600)
++        return prefs
++    except Exception as e:
++        logger.error(f"Error fetching customer preferences for user_id {user_id}: {e}")
++        return {}
++
++
++def Delete_customer_cache(login: str = None, user_id: int = None):
++    """FIX: use 'customeruser:' prefix (was incorrectly using 'user:')."""
++    if login:
++        cache.delete(f"customeruser:{login}")
++    if user_id:
++        cache.delete(f"customeruser:{user_id}")
++        cache.delete(f"customerpreferences:{user_id}")
++
++
++# ── CRUD ──────────────────────────────────────────────────────────────────────
++
++def customeruser_add(db: Session, user: CustomerUserSchema, change_user_id: int):
++    required_fields = ["first_name", "last_name", "login", "email", "valid_id"]
++    for field in required_fields:
++        if not getattr(user, field, None):
++            logger.error(f"Need {field}!")
++            raise CommanErrorException(f"Need {field}!")
++
++    if not is_valid_email(user.email):
++        logger.error(f"Email address ({user.email}) not valid!")
++        raise CommanErrorException(f"Email address ({user.email}) not valid!")
++
++    if email_exists(db, user.email):
++        logger.error(f"Email ({user.email}) already used.")
++        raise EmailAlreadyExistsError(f"Email address ({user.email}) is already used.")
++
++    if UserLoginExistsCheck(db, user.login):
++        logger.error(f"Login '{user.login}' already exists.")
++        raise LoginAlreadyExistsError(f"A user with the username '{user.login}' already exists.")
++
++    if not user.password:
++        user.password = generate_random_password()
++
++    new_user = CustomerUser(
++        title=user.title,
++        email=user.email,
++        first_name=user.first_name,
++        last_name=user.last_name,
++        login=user.login,
++        pw=hash_password(user.password),
++        valid_id=user.valid_id,
++        customer_id=user.customer_id,
++        phone=user.phone,
++        fax=user.fax,
++        mobile=user.mobile,
++        street=user.street,
++        zip=user.zip,
++        city=user.city,
++        country=user.country,
++        comments=user.comments,
++        create_by=change_user_id,
++        change_by=change_user_id,
++        create_time=func.now(),
++        change_time=func.now(),
++    )
++    db.add(new_user)
++    db.commit()
++    db.refresh(new_user)
++
++    user_data = _build_user_data(new_user)
++    cache.set(f"customeruser:{new_user.login}", user_data, expire=3600)
++    cache.set(f"customeruser:{new_user.id}", user_data, expire=3600)
++    return user_data
++
++
++def get_customeruser_data(db: Session, identifier):
++    cache_key = f"customeruser:{identifier}"
++    cached = cache.get(cache_key)
++    if cached:
++        return cached
++
++    user_data = None
++    if isinstance(identifier, int):
++        user_data = db.query(CustomerUser).filter(CustomerUser.id == identifier).first()
++    elif isinstance(identifier, str):
++        user_data = db.query(CustomerUser).filter(CustomerUser.login == identifier).first()
++
++    if user_data:
++        # FIX: pass user_data.id (int), not user_data.login (str)
++        preferences = get_all_preferences(db, user_data.id)
++        response_data = _build_user_data(user_data, preferences=preferences)
++        cache.set(f"customeruser:{user_data.login}", response_data, expire=3600)
++        cache.set(f"customeruser:{user_data.id}", response_data, expire=3600)
++        return response_data
++
++    return None
++
++
++def get_customeruser_hash_pwd(db: Session, login: str) -> str:
++    result = db.query(CustomerUser.pw).filter(CustomerUser.login == login).first()
++    return result[0] if result else None
++
++
++def get_customeruser_list(db: Session, page_no: int = 1, count_per_page: int = 10):
++    if page_no < 1 or count_per_page < 1:
++        raise CommanErrorException("Page number and count per page must be greater than zero.")
++
++    offset_value = (page_no - 1) * count_per_page
++    total_users = db.query(CustomerUser).count()
++    total_pages = ceil(total_users / count_per_page)
++
++    stmt = select(CustomerUser).offset(offset_value).limit(count_per_page)
++    result = db.execute(stmt).scalars().all()
++
++    user_list = [_build_user_data(u) for u in result]
++    return {
++        "total_users": total_users,
++        "total_pages": total_pages,
++        "current_page": page_no,
++        "users": user_list,
++    }
++
++
++def get_customeruser_search(
++    db: Session,
++    Search: Optional[str] = None,
++    UserLogin: Optional[str] = None,
++) -> List[dict]:
++    if not Search and not UserLogin:
++        raise CommanErrorException("At least one search parameter must be provided.")
++
++    query = db.query(CustomerUser)
++    if Search:
++        term = f"%{Search}%"
++        query = query.filter(
++            or_(
++                CustomerUser.first_name.ilike(term),
++                CustomerUser.last_name.ilike(term),
++                CustomerUser.login.ilike(term),
++                CustomerUser.email.ilike(term),
++            )
++        )
++    if UserLogin:
++        query = query.filter(CustomerUser.login.ilike(f"%{UserLogin}%"))
++
++    users = query.all()
++    return [_build_user_data(u) for u in users]
++
++
++def customer_user_update(db: Session, user_id: int, user: CustomerUserSchema, change_user_id: int):
++    existing_user = db.query(CustomerUser).filter(CustomerUser.id == user_id).first()
++    if not existing_user:
++        raise CommanErrorException(f"User with ID '{user_id}' not found.")
++
++    # Only first_name, last_name, login, email, valid_id are truly required
++    required_fields = ["first_name", "last_name", "login", "email", "valid_id"]
++    for field in required_fields:
++        if not getattr(user, field, None):
++            raise CommanErrorException(f"Need {field}!")
++
++    if not is_valid_email(user.email):
++        raise CommanErrorException(f"Email address ({user.email}) not valid!")
++
++    # FIX: compare against the model's email column, not preferences
++    if user.email != existing_user.email:
++        if email_exists(db, user.email, exclude_user_id=user_id):
++            raise EmailAlreadyExistsError(f"Email address ({user.email}) is already used.")
++
++    if user.login != existing_user.login and UserLoginExistsCheck(db, user.login, user_id):
++        raise LoginAlreadyExistsError(f"A user with the username '{user.login}' already exists.")
++
++    existing_user.first_name = user.first_name
++    existing_user.last_name = user.last_name
++    existing_user.login = user.login
++    existing_user.email = user.email
++    existing_user.valid_id = user.valid_id
++    existing_user.customer_id = user.customer_id
++    existing_user.phone = user.phone
++    existing_user.fax = user.fax
++    existing_user.mobile = user.mobile
++    existing_user.street = user.street
++    existing_user.zip = user.zip
++    existing_user.city = user.city
++    existing_user.country = user.country
++    existing_user.comments = user.comments
++    existing_user.change_by = change_user_id
++    existing_user.change_time = func.now()
++
++    if user.password:
++        existing_user.pw = hash_password(user.password)
++
++    db.commit()
++    db.refresh(existing_user)
++
++    user_data = _build_user_data(existing_user)
++    Delete_customer_cache(existing_user.login, existing_user.id)
++    cache.set(f"customeruser:{existing_user.login}", user_data, expire=3600)
++    cache.set(f"customeruser:{existing_user.id}", user_data, expire=3600)
++    return user_data
++
++
++# ── Internal helper ────────────────────────────────────────────────────────────
++
++def _build_user_data(user: CustomerUser, preferences: dict = None) -> dict:
++    data = {
++        "id": user.id,
++        "login": user.login,
++        "title": user.title,
++        "first_name": user.first_name,
++        "last_name": user.last_name,
++        "email": user.email,
++        "valid_id": user.valid_id,
++        "customer_id": user.customer_id,
++        "phone": user.phone,
++        "fax": user.fax,
++        "mobile": user.mobile,
++        "street": user.street,
++        "zip": user.zip,
++        "city": user.city,
++        "country": user.country,
++        "comments": user.comments,
++        "create_by": user.create_by,
++        "change_by": user.change_by,
++        "create_time": user.create_time.isoformat() if user.create_time else None,
++        "change_time": user.change_time.isoformat() if user.change_time else None,
++    }
++    if preferences is not None:
++        data["preferences"] = preferences
++    return data
+diff --git a/itsm/backend/app/controller/user_controller.py b/itsm/backend/app/controller/user_controller.py
+index c0d7b13e..bbab5bd5 100644
+--- a/itsm/backend/app/controller/user_controller.py
++++ b/itsm/backend/app/controller/user_controller.py
+@@ -9,6 +9,8 @@ from app.core.cache import Cache
+ from sqlalchemy import select, or_
+ from math import ceil
+ from typing import List, Optional
++import re
++
+ logger = get_logger(__name__)
+ cache = Cache()
+ 
+@@ -93,22 +95,18 @@ def user_add(db: Session, user: UserSchema, change_user_id: int):
+     return user_data
+ 
+ def is_valid_email(email: str) -> bool:
+-    # Implement email validation logic
+-    return True  # Assuming email validation is correct
+-
+-def email_exists(db: Session, email: str) -> bool:
+-    # Check if the email exists in the UserPreference table
+-    preference_exists = db.query(UserPreference.preferences_value).filter(
+-        UserPreference.preferences_key == 'UserEmail', 
+-        UserPreference.preferences_value == email.encode('utf-8')
+-    ).first()
+-    
+-    # If a matching email is found, return True
+-    if preference_exists:
+-        return True
+-    
+-    # If no matching email is found, return False
+-    return False
++    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
++    return bool(re.match(pattern, email))
++
++def email_exists(db: Session, email: str, exclude_user_id: int = None) -> bool:
++    """Check if email is already used by any agent user (stored in UserPreference as bytes)."""
++    query = db.query(UserPreference.user_id).filter(
++        UserPreference.preferences_key == 'UserEmail',
++        UserPreference.preferences_value == email.encode('utf-8'),
++    )
++    if exclude_user_id:
++        query = query.filter(UserPreference.user_id != exclude_user_id)
++    return db.query(query.exists()).scalar()
+ 
+ def get_user_data(db: Session, identifier):
+     cache_key = f"user:{identifier}"
+@@ -393,8 +391,8 @@ def user_update(db: Session, user_id: int, user: UserSchema, change_user_id: int
+     exist_preferences = get_all_preferences(db, user_id)
+     print(user.email, exist_preferences.get('UserEmail'))
+     # Check if email is already used (only if the email has changed)
+-    if user.email != exist_preferences.get('UserEmail') :
+-        if email_exists(db, user.email):
++    if user.email != exist_preferences.get('UserEmail'):
++        if email_exists(db, user.email, exclude_user_id=user_id):
+             logger.error(f"Email address ({user.email}) is already used by another user.")
+             raise EmailAlreadyExistsError(f"Email address ({user.email}) is already used.")
+     
+diff --git a/itsm/backend/app/core/config.py b/itsm/backend/app/core/config.py
+index 80f9bcef..27752ff5 100644
+--- a/itsm/backend/app/core/config.py
++++ b/itsm/backend/app/core/config.py
+@@ -1,12 +1,28 @@
+ import os
+ from pydantic_settings import BaseSettings
++from typing import List
+ 
+ class Settings(BaseSettings):
+-    CACHE_TYPE: str = "diskcache"  # or "diskcache"
++    # Cache
++    CACHE_TYPE: str = "diskcache"
+     REDIS_URL: str = "redis://localhost:6379/0"
+     DISKCACHE_DIR: str = "/opt/helpdesk_app/itsm/cache"
+ 
++    # JWT
++    SECRET_KEY: str = "change-me-in-production-use-a-long-random-string"
++    ALGORITHM: str = "HS256"
++    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
++
++    # CORS - comma-separated list of allowed origins
++    CORS_ORIGINS: str = "http://localhost:3000"
++
++    # Database
++    DATABASE_URL: str = "mysql+pymysql://otobo:pJDCvTgXthRkFSb4@localhost/otobo"
++
+     class Config:
+         env_file = ".env"
+ 
++    def get_cors_origins(self) -> List[str]:
++        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
++
+ settings = Settings()
+diff --git a/itsm/backend/app/db/session.py b/itsm/backend/app/db/session.py
+index 919f6799..c1ae430a 100644
+--- a/itsm/backend/app/db/session.py
++++ b/itsm/backend/app/db/session.py
+@@ -1,9 +1,8 @@
+ from sqlalchemy import create_engine
+ from sqlalchemy.orm import sessionmaker
++from app.core.config import settings
+ 
+-SQLALCHEMY_DATABASE_URL = "mysql+pymysql://otobo:pJDCvTgXthRkFSb4@localhost/otobo"
+-
+-engine = create_engine(SQLALCHEMY_DATABASE_URL)
++engine = create_engine(settings.DATABASE_URL)
+ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+ 
+ def get_db():
+diff --git a/itsm/backend/app/main.py b/itsm/backend/app/main.py
+index 05895d52..5084564a 100644
+--- a/itsm/backend/app/main.py
++++ b/itsm/backend/app/main.py
+@@ -1,39 +1,39 @@
+ from fastapi import FastAPI, Depends
+ from app.api.v1.user import router as user_router
+ from app.api.v1.customeruser import router as customeruser_router
+-from app.api.v1.auth import router as auth_router 
+-from app.api.v1.system import router as system_router 
++from app.api.v1.auth import router as auth_router
++from app.api.v1.system import router as system_router
+ from app.middleware.auth_middleware import AuthMiddleware
+ from fastapi.security import OAuth2PasswordBearer
+ from fastapi.middleware.cors import CORSMiddleware
++from app.core.config import settings
+ 
+ # Initialize FastAPI app
+ app = FastAPI()
+ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+ 
+-# Add CORS middleware
+-origins = [
+-    "http://192.168.1.8:3000",  # React app URL
+-]
+-
++# CORS — origins come from config/env, not hardcoded
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=origins,
++    allow_origins=settings.get_cors_origins(),
+     allow_credentials=True,
+-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],  # Specify allowed methods
+-    allow_headers=["*"],  # Allow all headers
++    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
++    allow_headers=["*"],
+ )
+ 
+-# Add custom authentication middleware
++# Custom JWT authentication middleware
+ app.add_middleware(AuthMiddleware)
+ 
+-# Public route - anyone can access this
++
+ @app.get("/")
+ def read_root():
+-    return {"message": "Welcome to the FastAPI User Management System"}
++    return {"message": "Welcome to the FastAPI Helpdesk System"}
++
++
++# Protected routes (require valid JWT)
++app.include_router(user_router, prefix="/api/v1/agent", dependencies=[Depends(oauth2_scheme)])
++app.include_router(customeruser_router, prefix="/api/v1/agent", dependencies=[Depends(oauth2_scheme)])
++app.include_router(system_router, prefix="/api/v1", dependencies=[Depends(oauth2_scheme)])
+ 
+-# Include routers
+-app.include_router(user_router, prefix="/api/v1/agent", dependencies=[Depends(oauth2_scheme)])  # Protected routes
+-app.include_router(customeruser_router, prefix="/api/v1/agent", dependencies=[Depends(oauth2_scheme)])  # Protected routes
+-app.include_router(system_router, prefix="/api/v1", dependencies=[Depends(oauth2_scheme)])  # Protected routes
+-app.include_router(auth_router, prefix="/auth")    # Public + protected auth routes
++# Public + protected auth routes
++app.include_router(auth_router, prefix="/auth")
+diff --git a/itsm/backend/app/middleware/auth_middleware.py b/itsm/backend/app/middleware/auth_middleware.py
+index 7bc9a127..99728239 100644
+--- a/itsm/backend/app/middleware/auth_middleware.py
++++ b/itsm/backend/app/middleware/auth_middleware.py
+@@ -1,81 +1,83 @@
+-import logging
+-from fastapi import Request
+-from sqlalchemy.orm import Session
+-from jose import JWTError, jwt
+-from starlette.middleware.base import BaseHTTPMiddleware
+-from starlette.responses import JSONResponse
+-from app.db.session import get_db
+-from app.controller.user_controller import get_user_data
+-from app.controller.customeruser_controller import get_customeruser_data
+-from starlette.responses import JSONResponse
+-
+-# Public routes
+-PUBLIC_ROUTES = ["/", "/auth/customer/login", "/auth/token", "/public-resource", "/docs", "/openapi.json"]
+-
+-# Setup logging
+-logging.basicConfig(level=logging.INFO)
+-logger = logging.getLogger(__name__)
+-
+-# JWT Secret and Configuration
+-SECRET_KEY = "your_secret_key_here"
+-ALGORITHM = "HS256"
+-
+-def create_error_response(status_code: int, detail: str):
+-    return JSONResponse(
+-        status_code=status_code,
+-        content={"detail": detail},
+-        headers={
+-            "Access-Control-Allow-Origin": "*",
+-            "Access-Control-Allow-Credentials": "true",
+-        }
+-    )
+-
+-class AuthMiddleware(BaseHTTPMiddleware):
+-    async def dispatch(self, request: Request, call_next):
+-        if request.method == "OPTIONS" or request.url.path in PUBLIC_ROUTES:
+-            return await call_next(request)
+-
+-        authorization: str = request.headers.get("Authorization")
+-        if not authorization:
+-            logger.error("Authorization header missing")
+-            return create_error_response(401, "Authorization header missing")
+-
+-        if not authorization.startswith("Bearer "):
+-            logger.error("Invalid Authorization header format")
+-            return create_error_response(401, "Invalid Authorization header format")
+-
+-        token = authorization.split(" ")[1]
+-
+-        try:
+-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+-            username = payload.get("sub")
+-            usertype = payload.get("usertype") or "agent"
+-
+-            if not username or not usertype:
+-                logger.error("Token does not contain a valid username or usertype")
+-                return create_error_response(401, "Invalid token")
+-
+-            db: Session = next(get_db())
+-            if usertype == "agent":
+-                user = get_user_data(db, username)
+-            elif usertype == "customeruser":
+-                user = get_customeruser_data(db, username)
+-            else:
+-                logger.error(f"Unknown usertype: {usertype}")
+-                return create_error_response(401, "Invalid usertype in token")
+-
+-            if not user:
+-                logger.error(f"User {username} not found in database")
+-                return create_error_response(401, "User not found")
+-
+-            request.state.user = user
+-
+-        except JWTError as jwt_error:
+-            logger.error(f"JWT Error: {jwt_error}")
+-            return create_error_response(401, "Invalid token or token expired")
+-        except Exception as e:
+-            logger.error(f"Unhandled error: {e}")
+-            return create_error_response(500, "Internal server error during authentication")
+-
+-        response = await call_next(request)
+-        return response
+\ No newline at end of file
++import logging
++from fastapi import Request
++from sqlalchemy.orm import Session
++from jose import JWTError, jwt
++from starlette.middleware.base import BaseHTTPMiddleware
++from starlette.responses import JSONResponse
++from app.db.session import get_db
++from app.core.config import settings
++from app.controller.user_controller import get_user_data
++from app.controller.customeruser_controller import get_customeruser_data
++
++# Public routes that skip auth
++PUBLIC_ROUTES = ["/", "/auth/customer/login", "/auth/token", "/public-resource", "/docs", "/openapi.json"]
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger(__name__)
++
++SECRET_KEY = settings.SECRET_KEY
++ALGORITHM = settings.ALGORITHM
++
++
++def create_error_response(status_code: int, detail: str):
++    return JSONResponse(
++        status_code=status_code,
++        content={"detail": detail},
++        headers={
++            "Access-Control-Allow-Origin": "*",
++            "Access-Control-Allow-Credentials": "true",
++        },
++    )
++
++
++class AuthMiddleware(BaseHTTPMiddleware):
++    async def dispatch(self, request: Request, call_next):
++        if request.method == "OPTIONS" or request.url.path in PUBLIC_ROUTES:
++            return await call_next(request)
++
++        authorization: str = request.headers.get("Authorization")
++        if not authorization:
++            logger.error("Authorization header missing")
++            return create_error_response(401, "Authorization header missing")
++
++        if not authorization.startswith("Bearer "):
++            logger.error("Invalid Authorization header format")
++            return create_error_response(401, "Invalid Authorization header format")
++
++        token = authorization.split(" ", 1)[1]
++
++        try:
++            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
++            username: str = payload.get("sub")
++            # FIX: key is "user_type" (with underscore), matching what auth.py encodes
++            user_type: str = payload.get("user_type", "agent")
++
++            if not username:
++                logger.error("Token missing 'sub' claim")
++                return create_error_response(401, "Invalid token")
++
++            db: Session = next(get_db())
++
++            if user_type == "agent":
++                user = get_user_data(db, username)
++            elif user_type == "customer":
++                user = get_customeruser_data(db, username)
++            else:
++                logger.error(f"Unknown user_type in token: {user_type}")
++                return create_error_response(401, "Invalid user_type in token")
++
++            if not user:
++                logger.error(f"User '{username}' not found in database")
++                return create_error_response(401, "User not found")
++
++            request.state.user = user
++            request.state.user_type = user_type
++
++        except JWTError as e:
++            logger.error(f"JWT error: {e}")
++            return create_error_response(401, "Invalid or expired token")
++        except Exception as e:
++            logger.error(f"Unhandled auth error: {e}")
++            return create_error_response(500, "Internal server error during authentication")
++
++        return await call_next(request)
+diff --git a/itsm/backend/app/requirements.txt b/itsm/backend/app/requirements.txt
+index f3153918..600d9866 100644
+--- a/itsm/backend/app/requirements.txt
++++ b/itsm/backend/app/requirements.txt
+@@ -2,6 +2,7 @@ fastapi
+ uvicorn
+ sqlalchemy
+ pydantic
++pydantic-settings
+ PyMySQL
+ redis
+ diskcache
+@@ -9,3 +10,4 @@ python-multipart
+ python-jose[cryptography]
+ passlib[bcrypt]
+ starlette
++email-validator
+diff --git a/itsm/backend/app/schemas/user.py b/itsm/backend/app/schemas/user.py
+index 7affb103..8ed07a4f 100644
+--- a/itsm/backend/app/schemas/user.py
++++ b/itsm/backend/app/schemas/user.py
+@@ -1,11 +1,12 @@
+ from pydantic import BaseModel, EmailStr, Field
++from typing import Optional
+ 
+ class UserSchema(BaseModel):
+-    title: str = None
++    title: Optional[str] = None
+     first_name: str
+     last_name: str
+     login: str
+-    password: str = None
++    password: Optional[str] = None
+     email: EmailStr
+     valid_id: int
+-    mobile: str
++    mobile: Optional[str] = None
+diff --git a/itsm/backend/app/utils.py b/itsm/backend/app/utils.py
+index 3c8bbbca..3bc1bf8e 100644
+--- a/itsm/backend/app/utils.py
++++ b/itsm/backend/app/utils.py
+@@ -1,9 +1,16 @@
+-import hashlib
+ import random
+ import string
++from passlib.context import CryptContext
++
++pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+ 
+ def hash_password(password: str) -> str:
+-    return hashlib.sha256(password.encode()).hexdigest()
++    """Hash a plain-text password using bcrypt."""
++    return pwd_context.hash(password)
++
++def verify_password(plain_password: str, hashed_password: str) -> bool:
++    """Verify a plain-text password against a bcrypt hash."""
++    return pwd_context.verify(plain_password, hashed_password)
+ 
+ def generate_random_password(length: int = 12) -> str:
+     return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
+diff --git a/itsm/frontend/.env.example b/itsm/frontend/.env.example
+new file mode 100644
+index 00000000..87ea32be
+--- /dev/null
++++ b/itsm/frontend/.env.example
+@@ -0,0 +1,2 @@
++# Copy to .env (or .env.local) and set your backend URL
++REACT_APP_API_URL=http://localhost:8001
+diff --git a/itsm/frontend/src/api/agentapiClient.js b/itsm/frontend/src/api/agentapiClient.js
+index 166f55c6..e734b572 100644
+--- a/itsm/frontend/src/api/agentapiClient.js
++++ b/itsm/frontend/src/api/agentapiClient.js
+@@ -1,15 +1,29 @@
+-import axios from 'axios';
+-import Cookies from 'js-cookie';
+-const agentapiClient = axios.create({
+-  baseURL: 'http://192.168.1.8:8001', // Update with your base URL
+-});
+-
+-agentapiClient.interceptors.request.use((config) => {
+-  const token = Cookies.get('agent_token');
+-  if (token) {
+-    config.headers.Authorization = `Bearer ${token}`;
+-  }
+-  return config;
+-});
+-
+-export default agentapiClient;
++import axios from 'axios';
++import Cookies from 'js-cookie';
++
++const agentapiClient = axios.create({
++  baseURL: process.env.REACT_APP_API_URL || 'http://localhost:8001',
++});
++
++// Attach agent token to every request
++agentapiClient.interceptors.request.use((config) => {
++  const token = Cookies.get('agent_token');
++  if (token) {
++    config.headers.Authorization = `Bearer ${token}`;
++  }
++  return config;
++});
++
++// Auto-logout on 401
++agentapiClient.interceptors.response.use(
++  (response) => response,
++  (error) => {
++    if (error.response?.status === 401) {
++      Cookies.remove('agent_token');
++      window.location.href = '/agent/login';
++    }
++    return Promise.reject(error);
++  }
++);
++
++export default agentapiClient;
+diff --git a/itsm/frontend/src/api/customerapiClient.js b/itsm/frontend/src/api/customerapiClient.js
+index 1ce381f0..45590267 100644
+--- a/itsm/frontend/src/api/customerapiClient.js
++++ b/itsm/frontend/src/api/customerapiClient.js
+@@ -1,16 +1,29 @@
+-import axios from 'axios';
+-import Cookies from 'js-cookie';
+-
+-const customerapiClient = axios.create({
+-  baseURL: 'http://192.168.1.8:8001', // Update with your base URL
+-});
+-
+-customerapiClient.interceptors.request.use((config) => {
+-  const token = Cookies.get('customeruser_token');
+-  if (token) {
+-    config.headers.Authorization = `Bearer ${token}`;
+-  }
+-  return config;
+-});
+-
+-export default customerapiClient;
++import axios from 'axios';
++import Cookies from 'js-cookie';
++
++const customerapiClient = axios.create({
++  baseURL: process.env.REACT_APP_API_URL || 'http://localhost:8001',
++});
++
++// Attach customer token to every request
++customerapiClient.interceptors.request.use((config) => {
++  const token = Cookies.get('customeruser_token');
++  if (token) {
++    config.headers.Authorization = `Bearer ${token}`;
++  }
++  return config;
++});
++
++// Auto-logout on 401
++customerapiClient.interceptors.response.use(
++  (response) => response,
++  (error) => {
++    if (error.response?.status === 401) {
++      Cookies.remove('customeruser_token');
++      window.location.href = '/customer/login';
++    }
++    return Promise.reject(error);
++  }
++);
++
++export default customerapiClient;
+diff --git a/itsm/frontend/src/auth/PrivateRoute.js b/itsm/frontend/src/auth/PrivateRoute.js
+index 727deb95..38ad0d39 100644
+--- a/itsm/frontend/src/auth/PrivateRoute.js
++++ b/itsm/frontend/src/auth/PrivateRoute.js
+@@ -1,27 +1,28 @@
+-import React from 'react';
+-import { Navigate } from 'react-router-dom';
+-import { useSelector } from 'react-redux';
+-
+-const PrivateRoute = ({ component: Component, usertype }) => {
+-  const isAgentAuthenticated = useSelector(
+-    (state) => state.agent.isAgentAuthenticated
+-  );
+-  const isCustomerAuthenticated = useSelector(
+-    (state) => state.customer.isCustomerAuthenticated
+-  );
+-  if (usertype === 'agent') {
+-    return isAgentAuthenticated ? (
+-      <Component />
+-    ) : (
+-      <Navigate to="/agent/login" />
+-    );
+-  } else if (usertype === 'customer') {
+-    return isCustomerAuthenticated ? (
+-      <Component />
+-    ) : (
+-      <Navigate to="/customer/login" />
+-    );
+-  }
+-};
+-
+-export default PrivateRoute;
++import React from 'react';
++import { Navigate } from 'react-router-dom';
++import { useSelector } from 'react-redux';
++import Cookies from 'js-cookie';
++
++/**
++ * PrivateRoute checks BOTH Redux state and the persisted cookie.
++ * This handles page refreshes where Redux state resets but the cookie survives.
++ */
++const PrivateRoute = ({ component: Component, usertype }) => {
++  const isAgentAuthenticated = useSelector((state) => state.agent.isAgentAuthenticated);
++  const isCustomerAuthenticated = useSelector((state) => state.customer.isCustomerAuthenticated);
++
++  if (usertype === 'agent') {
++    const hasToken = isAgentAuthenticated || !!Cookies.get('agent_token');
++    return hasToken ? <Component /> : <Navigate to="/agent/login" replace />;
++  }
++
++  if (usertype === 'customer') {
++    const hasToken = isCustomerAuthenticated || !!Cookies.get('customeruser_token');
++    return hasToken ? <Component /> : <Navigate to="/customer/login" replace />;
++  }
++
++  // Unknown usertype — redirect to agent login as safe fallback
++  return <Navigate to="/agent/login" replace />;
++};
++
++export default PrivateRoute;
+diff --git a/itsm/frontend/src/services/AuthService.js b/itsm/frontend/src/services/AuthService.js
+index 6ee0e476..9ee00b0b 100644
+--- a/itsm/frontend/src/services/AuthService.js
++++ b/itsm/frontend/src/services/AuthService.js
+@@ -1,62 +1,46 @@
+-import agentapiClient from '../api/agentapiClient';
+-import Cookies from 'js-cookie';
+-
+-export const agentLoginApi = async (username, password) => {
+-  try {
+-    const response = await agentapiClient.post(
+-      '/auth/token',
+-      new URLSearchParams({
+-        username,
+-        password,
+-      }),
+-      {
+-        headers: {
+-          'Content-Type': 'application/x-www-form-urlencoded',
+-        },
+-      }
+-    );
+-
+-    const { access_token } = response.data;
+-    Cookies.set('agent_token', access_token, {
+-      expires: 1,
+-      secure: false,
+-      sameSite: 'Strict',
+-    });
+-
+-    return response.data;
+-  } catch (error) {
+-    throw new Error(
+-      'Login failed: ' + (error.response?.data?.message || error.message)
+-    );
+-  }
+-};
+-
+-export const customerLoginApi = async (username, password) => {
+-  try {
+-    const response = await agentapiClient.post(
+-      '/auth/customer/login',
+-      new URLSearchParams({
+-        username,
+-        password,
+-      }),
+-      {
+-        headers: {
+-          'Content-Type': 'application/x-www-form-urlencoded',
+-        },
+-      }
+-    );
+-
+-    const { access_token } = response.data;
+-    Cookies.set('customeruser_token', `${access_token}`, {
+-      expires: 1,
+-      secure: false,
+-      sameSite: 'Strict',
+-    });
+-
+-    return response.data;
+-  } catch (error) {
+-    throw new Error(
+-      'Login failed: ' + (error.response?.data?.message || error.message)
+-    );
+-  }
+-};
++import agentapiClient from '../api/agentapiClient';
++import customerapiClient from '../api/customerapiClient';
++import Cookies from 'js-cookie';
++
++const COOKIE_OPTS = { expires: 1, secure: false, sameSite: 'Strict' };
++
++export const agentLoginApi = async (username, password) => {
++  try {
++    const response = await agentapiClient.post(
++      '/auth/token',
++      new URLSearchParams({ username, password }),
++      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
++    );
++    const { access_token } = response.data;
++    Cookies.set('agent_token', access_token, COOKIE_OPTS);
++    return response.data;
++  } catch (error) {
++    const detail = error.response?.data?.detail || error.response?.data?.message || error.message;
++    throw new Error('Login failed: ' + detail);
++  }
++};
++
++export const agentLogoutApi = () => {
++  Cookies.remove('agent_token');
++};
++
++export const customerLoginApi = async (username, password) => {
++  try {
++    // FIX: use customerapiClient (not agentapiClient) so the customer token is attached
++    const response = await customerapiClient.post(
++      '/auth/customer/login',
++      new URLSearchParams({ username, password }),
++      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
++    );
++    const { access_token } = response.data;
++    Cookies.set('customeruser_token', access_token, COOKIE_OPTS);
++    return response.data;
++  } catch (error) {
++    const detail = error.response?.data?.detail || error.response?.data?.message || error.message;
++    throw new Error('Login failed: ' + detail);
++  }
++};
++
++export const customerLogoutApi = () => {
++  Cookies.remove('customeruser_token');
++};
+-- 
+2.43.0
+

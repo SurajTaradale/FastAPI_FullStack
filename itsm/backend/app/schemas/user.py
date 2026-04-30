@@ -1,11 +1,12 @@
 from pydantic import BaseModel, EmailStr, Field
+from typing import Optional
 
 class UserSchema(BaseModel):
-    title: str = None
+    title: Optional[str] = None
     first_name: str
     last_name: str
     login: str
-    password: str = None
+    password: Optional[str] = None
     email: EmailStr
     valid_id: int
-    mobile: str
+    mobile: Optional[str] = None
