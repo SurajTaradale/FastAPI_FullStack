@@ -9,6 +9,8 @@ from app.core.cache import Cache
 from sqlalchemy import select, or_
 from math import ceil
 from typing import List, Optional
+import re
+
 logger = get_logger(__name__)
 cache = Cache()
 
@@ -93,22 +95,18 @@ def user_add(db: Session, user: UserSchema, change_user_id: int):
     return user_data
 
 def is_valid_email(email: str) -> bool:
-    # Implement email validation logic
-    return True  # Assuming email validation is correct
+    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+    return bool(re.match(pattern, email))
 
-def email_exists(db: Session, email: str) -> bool:
-    # Check if the email exists in the UserPreference table
-    preference_exists = db.query(UserPreference.preferences_value).filter(
-        UserPreference.preferences_key == 'UserEmail', 
-        UserPreference.preferences_value == email.encode('utf-8')
-    ).first()
-    
-    # If a matching email is found, return True
-    if preference_exists:
-        return True
-    
-    # If no matching email is found, return False
-    return False
+def email_exists(db: Session, email: str, exclude_user_id: int = None) -> bool:
+    """Check if email is already used by any agent user (stored in UserPreference as bytes)."""
+    query = db.query(UserPreference.user_id).filter(
+        UserPreference.preferences_key == 'UserEmail',
+        UserPreference.preferences_value == email.encode('utf-8'),
+    )
+    if exclude_user_id:
+        query = query.filter(UserPreference.user_id != exclude_user_id)
+    return db.query(query.exists()).scalar()
 
 def get_user_data(db: Session, identifier):
     cache_key = f"user:{identifier}"
@@ -393,8 +391,8 @@ def user_update(db: Session, user_id: int, user: UserSchema, change_user_id: int
     exist_preferences = get_all_preferences(db, user_id)
     print(user.email, exist_preferences.get('UserEmail'))
     # Check if email is already used (only if the email has changed)
-    if user.email != exist_preferences.get('UserEmail') :
-        if email_exists(db, user.email):
+    if user.email != exist_preferences.get('UserEmail'):
+        if email_exists(db, user.email, exclude_user_id=user_id):
             logger.error(f"Email address ({user.email}) is already used by another user.")
             raise EmailAlreadyExistsError(f"Email address ({user.email}) is already used.")
     

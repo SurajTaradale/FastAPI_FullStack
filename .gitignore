@@ -7,3 +7,7 @@ __pycache__/
 /cache
 itsm/cache/
 .env
+# Environment secrets - never commit real .env files
+itsm/backend/.env
+itsm/frontend/.env
+itsm/frontend/.env.local
