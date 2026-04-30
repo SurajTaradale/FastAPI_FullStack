@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-from app.utils import hash_password, verify_password
+from app.utils import hash_password, verify_password, needs_rehash
 from app.db.session import get_db
 from app.core.config import settings
 from app.controller.user_controller import get_user_data, get_user_hash_pwd
@@ -69,6 +69,12 @@ def authenticate_agent(db: Session, login: str, password: str):
     hashed = get_user_hash_pwd(db, login)
     if not hashed or not verify_password(password, hashed):
         return None
+    # Silent migration: if still SHA256, upgrade to bcrypt now
+    if needs_rehash(hashed):
+        from app.models.user import User
+        db.query(User).filter(User.login == login).update({"pw": hash_password(password)})
+        db.commit()
+        logger.info(f"Migrated agent '{login}' password from SHA256 to bcrypt")
     return user
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
@@ -113,6 +119,12 @@ def authenticate_customer(db: Session, login: str, password: str):
     hashed = get_customeruser_hash_pwd(db, login)
     if not hashed or not verify_password(password, hashed):
         return None
+    # Silent migration: if still SHA256, upgrade to bcrypt now
+    if needs_rehash(hashed):
+        from app.models.customeruser import CustomerUser
+        db.query(CustomerUser).filter(CustomerUser.login == login).update({"pw": hash_password(password)})
+        db.commit()
+        logger.info(f"Migrated customer '{login}' password from SHA256 to bcrypt")
     return user
 
 # ── Routes ───────────────────────────────────────────────────────────────────
